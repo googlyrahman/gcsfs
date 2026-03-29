@@ -2,10 +2,17 @@
 set -e
 source env/bin/activate
 
+# Temporary workaround: Disable mTLS for GCE Metadata Server discovery to avoid
+# transport and SSL verification errors on mTLS-enabled VMs. This ensures
+# stability across all Google SDKs while library-level mTLS fixes are finalized.
+# This is added to support the versioned tests
+export GCE_METADATA_MTLS_MODE=none
+
 # Common Exports
 export STORAGE_EMULATOR_HOST=https://storage.googleapis.com
 export GCSFS_TEST_PROJECT=${PROJECT_ID}
 export GCSFS_TEST_KMS_KEY=projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KEY_RING}/cryptoKeys/${KEY_NAME}
+export GOOGLE_CLOUD_PROJECT=${PROJECT_ID}
 
 # Pytest Arguments
 ARGS=(
@@ -108,6 +115,13 @@ case "$TEST_SUITE" in
       "--deselect=gcsfs/tests/test_core.py::test_array"
       "--deselect=gcsfs/tests/test_core.py::test_sign"
       "--deselect=gcsfs/tests/test_core.py::test_mv_file_cache"
+    )
+
+    # Zonal tests with prefetcher cache does not call _cat_file method.
+    # The following tests depends upon mocking the _cat_file method for regional.
+    ZONAL_DESELECTS+=(
+      "--deselect=gcsfs/tests/test_core.py::test_prefetcher_logical_chunk_override"
+      "--deselect=gcsfs/tests/test_core.py::test_fetch_logical_chunk_exception"
     )
 
     pytest "${ARGS[@]}" "${ZONAL_DESELECTS[@]}" gcsfs/tests/test_core.py

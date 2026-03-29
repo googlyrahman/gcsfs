@@ -26,6 +26,7 @@ from fsspec.implementations.http import get_client
 from fsspec.utils import setup_logging, stringify_path
 
 from . import __version__ as version
+from .caching import Prefetcher
 from .checkers import get_consistency_checker
 from .credentials import GoogleCredentials
 from .inventory_report import InventoryReport
@@ -1168,8 +1169,14 @@ class GCSFileSystem(asyn.AsyncFileSystem):
 
     async def _cat_file(self, path, start=None, end=None, **kwargs):
         """Simple one-shot get of file data"""
+        # if start and end are both provided and valid, but start >= end, return empty bytes
+        # Otherwise, _process_limits would generate an invalid HTTP range (e.g. "bytes=5-4"
+        # for start=5, end=5), causing the server to return the whole file instead of nothing.
+        if start is not None and end is not None and start >= end >= 0:
+            return b""
         u2 = self.url(path)
-        if start or end:
+        # 'if start or end' fails when start=0 or end=0 because 0 is Falsey.
+        if start is not None or end is not None:
             head = {"Range": await self._process_limits(path, start, end)}
         else:
             head = {}
@@ -1936,7 +1943,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         mode="rb",
         block_size=DEFAULT_BLOCK_SIZE,
         autocommit=True,
-        cache_type="readahead",
+        cache_type="prefetcher",
         cache_options=None,
         acl=None,
         consistency="md5",
@@ -1998,6 +2005,15 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         if not key:
             raise OSError("Attempt to open a bucket")
         self.generation = _coalesce_generation(generation, path_generation)
+
+        if cache_options is None:
+            cache_options = {}
+
+        if "r" in mode:
+            _FETCHER_OVERRIDE = {Prefetcher.name: self._fetch_logical_chunk}
+            if cache_type in _FETCHER_OVERRIDE:
+                cache_options["fetcher_override"] = _FETCHER_OVERRIDE[cache_type]
+
         super().__init__(
             gcsfs,
             path,
@@ -2014,8 +2030,13 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         self.acl = acl
         self.consistency = consistency
         self.checker = get_consistency_checker(consistency)
-        supports_append = kwargs.pop("supports_append", False)
-        if "a" in self.mode and not supports_append:
+        # _supports_append is an internal argument not meant to be used directly.
+        # If True, allows opening file in append mode. This is generally not supported
+        # by GCS, but may be supported by subclasses (e.g. ZonalFile). This flag should
+        # be set by subclasses that support append operations. Otherwise, the mode
+        # will be overwritten to "wb" mode with a warning.
+        _supports_append = kwargs.pop("_supports_append", False)
+        if "a" in self.mode and not _supports_append:
             warnings.warn(
                 "Append mode 'a' is not supported in GCS. Using overwrite mode instead."
             )
@@ -2196,6 +2217,51 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             if "not satisfiable" in str(e):
                 return b""
             raise
+
+    async def _fetch_logical_chunk(self, start_offset, total_size, split_factor=1):
+        """
+        Async fetcher mapped to the Prefetcher cache for regional buckets.
+        Uses concurrent HTTP range requests for split downloads.
+        """
+        if split_factor == 1:
+            return await self.gcsfs._cat_file(
+                self.path, start=start_offset, end=start_offset + total_size
+            )
+
+        part_size = total_size // split_factor
+        tasks = []
+
+        for i in range(split_factor):
+            offset = start_offset + (i * part_size)
+            actual_size = (
+                part_size if i < split_factor - 1 else total_size - (i * part_size)
+            )
+
+            tasks.append(
+                asyncio.create_task(
+                    self.gcsfs._cat_file(
+                        self.path, start=offset, end=offset + actual_size
+                    )
+                )
+            )
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    raise res
+            return b"".join(results)
+        except asyncio.CancelledError as e:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise e
+
+    def close(self):
+        if hasattr(self, "cache") and self.cache and hasattr(self.cache, "close"):
+            self.cache.close()
+        super().close()
 
 
 def _convert_fixed_key_metadata(metadata, *, from_google=False):

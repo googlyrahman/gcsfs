@@ -2,14 +2,16 @@ import asyncio
 import logging
 import os
 import uuid
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from glob import has_magic
-from io import BytesIO
 
 from fsspec import asyn
 from fsspec.callbacks import NoOpCallback
 from google.api_core import exceptions as api_exceptions
 from google.api_core.client_info import ClientInfo
+from google.api_core.client_options import ClientOptions
 from google.auth.credentials import AnonymousCredentials
 from google.cloud import storage_control_v2
 from google.cloud.storage.asyncio.async_appendable_object_writer import (
@@ -67,6 +69,10 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         if self.credentials.token == "anon":
             self.credential = AnonymousCredentials()
         self._storage_layout_cache = {}
+        self.memmove_executor = ThreadPoolExecutor(
+            max_workers=kwargs.get("memmove_max_workers", 8)
+        )
+        weakref.finalize(self, self.memmove_executor.shutdown)
 
     @property
     def grpc_client(self):
@@ -80,9 +86,15 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
     async def _get_grpc_client(self):
         if self._grpc_client is None:
+            client_options = None
+            if self._location:
+                # client_options expects only the host:port, without the protocol.
+                endpoint = self._location.split("://")[-1]
+                client_options = ClientOptions(api_endpoint=endpoint)
             self._grpc_client = AsyncGrpcClient(
                 credentials=self.credential,
                 client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
+                client_options=client_options,
             )
         return self._grpc_client
 
@@ -194,9 +206,6 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
         Returns:
             tuple: A tuple containing (offset, length).
-
-        Raises:
-            ValueError: If the calculated range is invalid.
         """
         size = file_size
 
@@ -204,7 +213,8 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             offset = 0
         elif start < 0:
             size = (await self._info(path))["size"] if size is None else size
-            offset = size + start
+            # If start is negative and larger than the file size, we should start from 0.
+            offset = max(0, size + start)
         else:
             offset = start
 
@@ -217,14 +227,9 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         else:
             effective_end = end
 
-        if offset < 0:
-            raise ValueError(f"Calculated start offset ({offset}) cannot be negative.")
-        if effective_end < offset:
-            raise ValueError(
-                f"Calculated end position ({effective_end}) cannot be before start offset ({offset})."
-            )
-        elif effective_end == offset:
-            length = 0  # Handle zero-length slice
+        # If the requested end is before/ same as the start, return empty.
+        if effective_end <= offset:
+            return offset, 0
         else:
             length = effective_end - offset  # Normal case
             size = (await self._info(path))["size"] if size is None else size
@@ -272,7 +277,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             file_size = size or mrd.persisted_size
             if file_size is None:
                 logger.warning(
-                    "AsyncMultiRangeDownloader (MRD) has no 'persisted_size'. "
+                    f"AsyncMultiRangeDownloader (MRD) for {path} has no 'persisted_size'. "
                     "Falling back to _info() to get the file size."
                 )
                 file_size = (await self._info(path))["size"]
@@ -287,22 +292,13 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                 ):
                     raise RuntimeError("Request not satisfiable.")
 
-                buffers = []  # To hold the results in order
                 read_ranges = []  # To pass to MRD
 
                 for length in chunk_lengths:
-                    buf = BytesIO()
-                    buffers.append(buf)
-
-                    if length > 0:
-                        read_ranges.append((current_offset, length, buf))
-
+                    read_ranges.append((current_offset, length))
                     current_offset += length
 
-                if read_ranges:
-                    await mrd.download_ranges(read_ranges)
-
-                return [b.getvalue() for b in buffers]
+                return await zb_hns_utils.download_ranges(read_ranges, mrd)
             else:
                 end = kwargs.get("end")
                 offset, length = await self._process_limits_to_offset_and_length(
@@ -352,7 +348,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             file_size = mrd.persisted_size
             if file_size is None:
                 logger.warning(
-                    "AsyncMultiRangeDownloader (MRD) exists but has no 'persisted_size'. "
+                    f"AsyncMultiRangeDownloader (MRD) for {path} has no 'persisted_size'. "
                     "Falling back to _info() to get the file size. "
                     "This may result in incorrect behavior for unfinalized objects."
                 )
@@ -553,56 +549,108 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             raise
 
     async def _mkdir(
-        self, path, create_parents=False, enable_hierarchical_namespace=False, **kwargs
+        self,
+        path,
+        create_parents=False,
+        enable_hierarchical_namespace=False,
+        placement=None,
+        location=None,
+        **kwargs,
     ):
         """
-        If the path does not contain an object key, a new bucket is created.
-        If `enable_hierarchical_namespace` is True, the bucket will have Hierarchical Namespace enabled.
+        Create a directory or bucket.
 
-        For HNS-enabled buckets, this method creates a folder object. If
-        `create_parents` is True, any missing parent folders are also created.
+        If the path refers to a bucket (no object key), a new bucket is created.
+        If the path refers to a directory (includes object key), a directory is created.
 
-        If bucket doesn't exist, enable_hierarchical_namespace and create_parents are set to True
-        and the path includes a key then HNS-enabled bucket will be created
-        and also the folders within that bucket.
+        Parameters
+        ----------
+        path : str
+            Path to create.
+        create_parents : bool
+            If True, create parent directories if they do not exist.
+            If the path includes a bucket that does not exist, the bucket will also be created.
+        enable_hierarchical_namespace : bool
+            If True, and a bucket is being created, the bucket will have Hierarchical
+            Namespace (HNS) enabled.
+        placement : str, optional
+            If set to a zone (e.g. "us-central1-a"), a Zonal bucket is created.
+            Zonal buckets are HNS-enabled by default.
+            When creating a Zonal bucket, `location` must be passed as a
+            region (e.g. "us-central1"). If `location` is not specified, it defaults
+            to `self.default_location`. The zone specified in `placement` must belong
+            to the region specified in `location`.
+        location : str, optional
+            Location where buckets are created, like 'US' or 'EUROPE-WEST3'.
+            If not provided, defaults to `self.default_location`.
+        **kwargs : dict
+            Additional arguments passed to the bucket creation API.
 
-        If `create_parents` is False and a parent does not exist, a
-        FileNotFoundError is raised.
-
-        For non-HNS buckets, it falls back to the parent implementation which
-        may involve creating a bucket or doing nothing (as GCS has no true empty directories).
+        Notes
+        -----
+        - For HNS-enabled buckets (including Zonal buckets), this method creates a
+          native folder object.
+        - If `create_parents` is False and a parent directory does not exist in an
+          HNS/Zonal bucket, a FileNotFoundError is raised.
+        - For non-HNS buckets, this falls back to the parent implementation. Since
+          standard GCS has no true directories, `mkdir` on a path with a key is
+          typically a no-op unless `create_parents=True` triggers bucket creation.
         """
         path = self._strip_protocol(path)
-        if enable_hierarchical_namespace:
-            kwargs["hierarchicalNamespace"] = {"enabled": True}
+        bucket, key, _ = self.split_path(path)
+
+        # Determine if we are requesting creation of a Zonal or HNS bucket
+        should_create_zonal_bucket = placement is not None
+        should_create_hns_bucket = (
+            enable_hierarchical_namespace or should_create_zonal_bucket
+        )
+
+        # Prepare arguments for bucket creation
+        bucket_kwargs = kwargs.copy()
+        if location:
+            bucket_kwargs["location"] = location
+        if should_create_zonal_bucket:
+            bucket_kwargs["customPlacementConfig"] = {"dataLocations": [placement]}
+            bucket_kwargs["storageClass"] = "RAPID"
+
+        if should_create_hns_bucket:
+            bucket_kwargs["hierarchicalNamespace"] = {"enabled": True}
             # HNS buckets require uniform bucket-level access.
-            kwargs["iamConfiguration"] = {"uniformBucketLevelAccess": {"enabled": True}}
+            bucket_kwargs["iamConfiguration"] = {
+                "uniformBucketLevelAccess": {"enabled": True}
+            }
             # When uniformBucketLevelAccess is enabled, ACLs cannot be used.
             # We must explicitly set them to None to prevent the parent
             # method from using default ACLs.
-            kwargs["acl"] = None
-            kwargs["default_acl"] = None
+            bucket_kwargs["acl"] = None
+            bucket_kwargs["default_acl"] = None
 
-        bucket, key, _ = self.split_path(path)
-        # If the key is empty, the path refers to a bucket, not an object.
-        # Defer to the parent method to handle bucket creation.
+        # Case 1: Path is just a bucket
         if not key:
-            return await super()._mkdir(path, create_parents=create_parents, **kwargs)
+            return await super()._mkdir(
+                path, create_parents=create_parents, **bucket_kwargs
+            )
 
-        is_hns = False
-        # If creating an HNS bucket, check for its existence first.
-        if create_parents and enable_hierarchical_namespace:
+        # Case 2: Path is a folder
+        is_hns_bucket = False
+
+        # If creating parents and HNS/Zonal requested, ensure bucket exists with correct config
+        if create_parents and should_create_hns_bucket:
             if not await self._exists(bucket):
-                await super()._mkdir(bucket, create_parents=True, **kwargs)
-                is_hns = True  # Skip HNS check since we just created it.
+                await super()._mkdir(bucket, create_parents=True, **bucket_kwargs)
+                is_hns_bucket = True
 
-        if not is_hns:
-            # If the bucket was not created above, we need to check its type.
-            is_hns = await self._is_bucket_hns_enabled(bucket)
+        if not is_hns_bucket:
+            is_hns_bucket = await self._is_bucket_hns_enabled(bucket)
 
-        if not is_hns:
-            return await super()._mkdir(path, create_parents=create_parents, **kwargs)
+        if is_hns_bucket:
+            return await self._create_hns_folder(path, bucket, key, create_parents)
 
+        return await super()._mkdir(
+            path, create_parents=create_parents, **bucket_kwargs
+        )
+
+    async def _create_hns_folder(self, path, bucket, key, create_parents):
         logger.debug(f"Using HNS-aware mkdir for '{path}'.")
         parent = f"projects/_/buckets/{bucket}"
         folder_id = key.rstrip("/")
@@ -1271,7 +1319,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             size = mrd.persisted_size
             if size is None:
                 logger.warning(
-                    "AsyncMultiRangeDownloader (MRD) has no 'persisted_size'. "
+                    f"AsyncMultiRangeDownloader (MRD) for {rpath} has no 'persisted_size'. "
                     "Falling back to _info() to get the file size. "
                     "This may result in incorrect behavior for unfinalized objects."
                 )
@@ -1365,6 +1413,25 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             "Server-side copy involving Zonal buckets is not supported. "
             "Zonal objects do not support rewrite."
         )
+
+    async def _merge(self, path, paths, acl=None):
+        """Concatenate objects within a single bucket.
+
+        For Standard GCS buckets, falls back to the parent class's implementation
+
+        Zonal Bucket Support:
+        Server-side compose is currently NOT supported for Zonal buckets.
+        """
+        bucket, _, _ = self.split_path(path)
+
+        if await self._is_zonal_bucket(bucket):
+            raise NotImplementedError(
+                "Server-side compose/merge is not supported for Zonal buckets."
+            )
+
+        return await super()._merge(path, paths, acl=acl)
+
+    merge = asyn.sync_wrapper(_merge)
 
 
 async def upload_chunk(fs, location, data, offset, size, content_type):
